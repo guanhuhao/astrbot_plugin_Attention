@@ -1,203 +1,461 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import aiohttp
+import traceback
+import re
+import os
+import json
+import uuid
+import datetime
+import zoneinfo
+
 from astrbot.api.all import (
     Star, Context, register,
     AstrMessageEvent, command_group,  MessageEventResult
 )
-from astrbot.core.conversation_mgr import Conversation
-import json
-from astrbot.core.utils.session_waiter import (
-    session_waiter,
-    SessionFilter,
-    SessionController,
-)
-# from .util.my_session import (
-#     session_waiter,
-#     SessionFilter,
-#     SessionController,
-# )
-import astrbot.api.message_components as Comp
-import time
-import asyncio
-import os
-
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from astrbot.api.event import filter
+from astrbot.api import logger, llm_tool
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from typing import Optional
 
-MESSAGE_TIME = {}
-HISTORY_LIST = {}
-LAST_MESSAGE = {}
+def format_weather_info(city: str, weather_dict):
+  """
+  使用正则表达式模板构造天气描述
+  """
+  # 获取当前时间戳
+  current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  
+  # 定义天气描述模板
+  template = f"当前时间:{current_time} 地点:" + city + r" {date} 周{week} 天气预报：白天{dayweather}，气温{daytemp}°C ~ {nighttemp} °C, {daywind}风{daypower}级；夜间{nightweather}， {nightwind}风{nightpower}级。"
+  
+  # 使用正则表达式替换占位符
+  pattern = r'\{(\w+)\}'
+  
+  def replace_func(match):
+      key = match.group(1)
+      return str(weather_dict.get(key, f'{{{key}}}'))
+  
+  result = re.sub(pattern, replace_func, template)
 
-@register("attention", "AttentionBot", "群聊注意力管理插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+  return result
+
+@register(
+    "daily_weather",
+    "Guan",
+    "一个基于高德开放平台API的天气查询插件",
+    "1.0.0",
+    "https://github.com/guanhuhao/astrbot_plugin_daily_weather.git"
+)
+class WeatherPlugin(Star):
+    """
+    这是一个调用高德开放平台API的天气查询和订阅插件。
+    支持以下命令：
+    - /weather [城市]: 查询指定城市的天气预报
+    - /weather_subscribe subscribe [描述]: 订阅天气预报
+    - /weather_subscribe ls: 查看当前订阅列表
+    - /weather_subscribe rm <序号>: 删除指定序号的订阅
+    """
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.group_offset = {}
-        self.score_threshold = {}
-        self.interval = {}
+        self.config = config
+        # 使用配置中的 amap_api_key
+        self.api_key = config.get("amap_api_key", "")
+        self.default_city = config.get("default_city", "北京")
+        # 新增配置项：send_mode，控制发送模式 "image" 或 "text"
+        self.send_mode = config.get("send_mode", "image")
+        logger.debug(f"WeatherPlugin initialized with API key: {self.api_key}, default_city: {self.default_city}, send_mode: {self.send_mode}")
 
-        # 持久化
-        self.config_path = os.path.join(get_astrbot_data_path(), "astrbot-attention.json")            
-        logger.info(f"load config: {get_astrbot_data_path()}")
-        if not os.path.exists(self.config_path):
-            with open(self.config_path, "w", encoding="utf-8") as f:
+        # subscribe init
+        self.timezone = self.context.get_config().get("timezone")
+        if not self.timezone:
+            self.timezone = None
+        try:
+            self.timezone = zoneinfo.ZoneInfo(self.timezone) if self.timezone else None
+        except Exception as e:
+            logger.error(f"时区设置错误: {e}, 使用本地时区")
+            self.timezone = None
+        self.scheduler = AsyncIOScheduler(timezone=self.timezone)
+        subscribe_file = os.path.join(get_astrbot_data_path(), "astrbot-subscribe.json")
+        if not os.path.exists(subscribe_file):
+            with open(subscribe_file, "w", encoding="utf-8") as f:
                 f.write("{}")
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            self.group_offset, self.score_threshold, self.interval = json.load(f)
+        with open(subscribe_file, "r", encoding="utf-8") as f:
+            self.subscribe_data = json.load(f)
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-    
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @command_group("attention",alias={'群注意力'})
-    def Attention(self, event: AstrMessageEvent):
-        """
-        群聊注意力管理指令
-        使用方法:
-        /attention on - 开启群聊注意力
-        /attention off - 关闭群聊注意力
-        /attention status - 查看当前状态
-        /attention set_interval <秒数> - 设置回复间隔
-        /attention set_temp <数值> - 设置回复欲望(0-100)
-        """
-        return
-    
-    @Attention.command("set_interval",alias={'设置回复间隔'})
-    async def set_interval(self, event: AstrMessageEvent, interval:float):
-        """
-        设置机器人主动回复的时间间隔
-        参数:
-            interval: 回复间隔时间(秒)
-        """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        self.interval[gid] = interval
-        await self._save_data()
-        yield event.plain_result(f"设置主动回复间隔为{self.interval[gid]}秒")
+        self._init_scheduler()
+        self.scheduler.start()
 
-    @Attention.command("set_temp",alias={'设置回复欲望'})
-    async def set_temperature(self, event: AstrMessageEvent, score_threshold:float):
-        """
-        设置机器人回复的阈值
-        参数:
-            score_threshold: 回复阈值(0-100)，数值越高越容易回复
-        """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        self.score_threshold[gid] = score_threshold
-        await self._save_data()
-        yield event.plain_result(f"设置回复欲望为{self.score_threshold[gid]}，0-100，0为最低，100为最高")
-
-    @Attention.command("on")
-    async def Attention_on(self, event: AstrMessageEvent):
-        """
-        开启群聊注意力
-        """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        self.group_offset[gid] = 1
-        logger.info(f"当前群聊注意力状态: {self.group_offset[gid]}")
-        await self._save_data()
-        yield event.plain_result("开启群聊注意力")
-
-    @Attention.command("off")
-    async def Attention_off(self, event: AstrMessageEvent):
-        """
-        关闭群聊注意力
-        """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        self.group_offset[gid] = 0
-        logger.info(f"当前群聊注意力状态: {self.group_offset[gid]}")
-        await self._save_data()
-        yield event.plain_result("关闭群聊注意力")
-
-    @Attention.command("status")
-    async def Attention_status(self, event: AstrMessageEvent):
-        """
-        显示当前群聊注意力状态
-        """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        if self.group_offset.get(gid) is None:
-            self.group_offset[gid] = 0
-            self.interval[gid] = 10
-            self.score_threshold[gid] = 50
-        logger.info(f"当前群聊注意力状态: {self.group_offset[gid]}")
-        if self.group_offset[gid] == 1:
-            yield event.plain_result(f"已开启群聊注意力，活跃状态，会自主判断是否需要回复消息\n主动回复间隔: {self.interval[gid]}秒\n回复欲望: {self.score_threshold[gid]}")
-        else:
-            yield event.plain_result(f"已关闭群聊注意力，静默状态，（群聊中只有@的消息才会回复或者以'/'开头的才会回复）\n主动回复间隔: {self.interval[gid]}秒\n回复欲望: {self.score_threshold[gid]}")
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_all_message(self, event: AstrMessageEvent):
-        class CustomFilter(SessionFilter):
-            def filter(self, event: AstrMessageEvent) -> str:
-                return event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-            
-        @session_waiter(timeout=10, record_history_chains=True) # 注册一个会话控制器，设置超时时间为 10 秒，记录历史消息链 
-        async def empty_mention_waiter(controller: SessionController, event: AstrMessageEvent):
-            gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-            
-            controller.keep(timeout=self.interval[gid], reset_timeout=True)
-            logger.info(f"update MESSAGE_TIME: controller.ts: {controller.ts} MESSAGE_TIME[gid]: {MESSAGE_TIME[gid]}")
-            if MESSAGE_TIME.get(gid) is None:
-                MESSAGE_TIME[gid] = controller.ts
-                LAST_MESSAGE[gid] = event.message_obj.message_str
-                HISTORY_LIST[gid] = controller.get_history_chains()
-            elif controller.ts > MESSAGE_TIME[gid]:
-                
-                MESSAGE_TIME[gid] = controller.ts
-                LAST_MESSAGE[gid] = event.message_obj.message_str
-                HISTORY_LIST[gid] = controller.get_history_chains()
-          
-        global LAST_MESSAGE, HISTORY_LIST, MESSAGE_TIME
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
-        if self.group_offset.get(gid) is None:
-            self.group_offset[gid] = 0
-            self.interval[gid] = 10
-            self.score_threshold[gid] = 50
-        # logger.info(f"当前群聊注意力状态: {self.offset}")
-        if self.group_offset[gid] == 1 and (event.message_obj.message_str[0] != '/'):
-            logger.info(f"event.message_str: {event.message_obj.message_str}")
-            try:
-                LAST_MESSAGE[gid] = event.message_obj.message_str
-                HISTORY_LIST[gid] = [[]]
-                MESSAGE_TIME[gid] = 0
-                await empty_mention_waiter(event=event)
-                # logger.info(f"after event.is_wake: {a}")
-            except TimeoutError as _: # 当超时后，会话控制器会抛出 TimeoutError
-                # yield event.plain_result("你超时了！")
-                conversation = ""
-                idx = 0
-
-                for i in HISTORY_LIST[gid][0]:
-                    conversation += f"{idx}: {i.text}\n"
-                    idx += 1
-                prompt = f"根据最近5条的对话内容：{conversation}以及最近的这条消息{LAST_MESSAGE[gid]}，判断用户是否在与你交流（他可能再跟之前对话的人进行进一步交流），以及是否需要你回复，给出你判断的意图分数，分数范围为0-100，请直接给出大致分数，然后再大致分数上随机加减0-10的随机数，最后输出只需要输出一个0-100的数字即可"
-                score = await self.context.get_using_provider().text_chat(
-                        prompt=prompt,
-                        system_prompt="",
-                        image_urls=[], # 图片链接，支持路径和网络链接
+    def _init_scheduler(self):
+        """Initialize the scheduler."""
+        for group in self.subscribe_data:
+            for subscribe in self.subscribe_data[group]:
+                if "id" not in subscribe:
+                    id_ = str(uuid.uuid4())
+                    subscribe["id"] = id_
+                else:
+                    id_ = subscribe["id"]
+                if "datetime" in subscribe:
+                    if self.check_is_outdated(subscribe):
+                        continue
+                    self.scheduler.add_job(
+                        self._subscribe_callback,
+                        id=id_,
+                        trigger="date",
+                        args=[group, subscribe],
+                        run_date=datetime.datetime.strptime(
+                            subscribe["datetime"], "%Y-%m-%d %H:%M"
+                        ),
+                        misfire_grace_time=60,
                     )
-                score = score.completion_text
-                
-                logger.info(f"score_threshold: {100-self.score_threshold[gid]} 回复概率: {int(score)}")
-                if int(score) > 100 - self.score_threshold[gid]:
-                    prompt = f"根据最近5条的对话内容：{conversation}，返回对最新信息 {LAST_MESSAGE[gid]} 的回复，直接回复，不要输出任何解释"
-                    yield event.request_llm(
-                        prompt=prompt,
-                        system_prompt="",
-                        # conversation=conversation
+                elif "cron" in subscribe:
+                    self.scheduler.add_job(
+                        self._subscribe_callback,
+                        trigger="cron",
+                        id=id_,
+                        args=[group, subscribe],
+                        misfire_grace_time=60,
+                        **self._parse_cron_expr(subscribe["cron"]),
                     )
+                    
+    def check_is_outdated(self, subscribe: dict):
+        """Check if the subscribe is outdated."""
+        if "datetime" in subscribe:
+            subscribe_time = datetime.datetime.strptime(
+                subscribe["datetime"], "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=self.timezone)
+            return subscribe_time < datetime.datetime.now(self.timezone)
+        return False
 
-            except Exception as e:
-                logger.error(f"empty_mention_waiter 异常: {e}")
-                # return        
-            finally:
-                event.stop_event()
-            logger.info(f"HISTORY_LIST: {HISTORY_LIST}")
 
+    async def use_LLM(self, result: str, config: dict) -> str:
+        """
+        使用 LLM 服务来润色天气预报结果
+        Args:
+            result: 原始天气预报文本
+            config: LLM配置信息
+        Returns:
+            str: 润色后的天气预报文本
+        """
+        try:
+            # 构建 prompt
+            if len(self.config.get("LLM_prompt", "")) < 5:
+                prompt = f"""
+                {result}
+                请根据上面天气预报信息，润色天气预报文本，但保持信息准确性：
+                
+                要求：
+                1. 天气现象描述要专业,使用适当emoji
+                2. 可以根据天气提供小提示（列点），要让人感觉到很贴心温暖
+                3. 保持所有数据的准确性
+                4. 控制在150字以内
+                5. 语气要以可爱的女生语气，给人带来活力满满的能量，但不要太做作
+                6. 禁止使用** 或者 # 等markdown格式
+
+                例子：
+                2024-03-19 周二 天气小播报（杭州） 预报时间：09:00:00
+                大家早安哦~ 今天白天是超美的晴天☀️呢！气温在25°C~15°C之间波动，晚上转为多云，今天风蛮大的，早上东南风3级，晚上西北风2级，记得多穿件外套哦~
+                
+                小贴士：
+                - 今天温差有点大，记得带件外套呀~
+                - 白天阳光超好，防晒霜别忘记涂哦！
+                - 晚上多云很舒服，适合和朋友出去走走
+                
+                这么好的天气，心情都会变得超棒的！记得好好享受这个美丽的春日～
+                
+                """
+            else:
+                prompt = result + "\n" + "请根据上面天气预报信息，润色天气预报文本，但保持信息准确性：" + "\n" + self.config.get("LLM_prompt", "")
+
+            result = await self.context.get_using_provider().text_chat(
+                    prompt=prompt,
+                    # func_tool_manager=func_tools_mgr,
+                    # session_id=curr_cid, # 对话id。如果指定了对话id，将会记录对话到数据库
+                    # contexts=context, # 列表。如果不为空，将会使用此上下文与 LLM 对话。
+                    system_prompt="",
+                    image_urls=[], # 图片链接，支持路径和网络链接
+                    # conversation=conversation # 如果指定了对话，将会记录对话
+                )
+            result = result.completion_text
+            return result
+
+        except Exception as e:
+            logger.error(f"LLM enhancement failed: {e}")
+            logger.error(traceback.format_exc())
+            return result
+
+
+    # =============================
+    # 命令组 "weather"
+    # =============================
+    @filter.command("weather", alias={'天气'})
+    async def weather_current(self, event: AstrMessageEvent, city: Optional[str] = "杭州"):
+        """
+        查看城市天气预报信息
+        用法: /weather [城市]
+        示例: /weather 北京
+        说明: 如果不指定城市，将使用默认城市
+        """
+        logger.info(f"User called /weather current with city={city}")
+        if not city:
+            city = self.default_city
+        if not self.api_key:
+            yield event.plain_result("未配置 Amap API Key，无法查询天气。请在管理面板中配置后再试。")
+            return
+        data = await self.get_future_weather_by_city(city)
+        if data is None:
+            yield event.plain_result(f"查询 [{city}] 的当前天气失败，请稍后再试。")
+            return
         
+        # 根据配置决定发送模式
+        if self.send_mode == "image":
+            result_img_url = await self.render_current_weather(data)
+            yield event.image_result(result_img_url)
+        else:
+            text = format_weather_info(city, data[0])
+            # 使用 LLM 润色结果
+            logger.info(f"original weather text={text}")
+            enhanced_text = await self.use_LLM(text, self.config)
+            logger.info(f"LLM enhanced weather text={enhanced_text}")
+            yield event.plain_result(enhanced_text)
+
+
+        # =============================
+    
+    
+    # 命令组 "weather_subscribe"
+    # =============================
+    @command_group("weather_subscribe", alias={'天气订阅'})
+    def weather_subscribe_group(self):
+        """
+        天气订阅相关功能命令组。
+        使用方法：
+        /weather_subscribe <子指令> [参数]
+        子指令包括：
+        - subscribe: 订阅天气预报
+        - ls: 查看订阅列表
+        - rm: 删除指定订阅
+        """
+        pass
+    @weather_subscribe_group.command("subscribe", alias={'订阅'})
+    async def weather_subscribe(self, event: AstrMessageEvent, description: str = ""):
+        """
+        订阅天气预报
+        用法: /weather subscribe <城市>
+        示例: /weather subscribe 北京
+        """
+        city = "上海"
+        cron_expression = "0 9 * * *"
+        human_readable_cron = "每天9点"
+
+        if description != "":
+            city = await self.context.get_using_provider().text_chat(
+                prompt=description,
+                # func_tool_manager=func_tools_mgr,
+                # session_id=curr_cid, # 对话id。如果指定了对话id，将会记录对话到数据库
+                # contexts=context, # 列表。如果不为空，将会使用此上下文与 LLM 对话。
+                system_prompt="请分析提取出城市名称,只需要输出城市名称如 杭州",
+                image_urls=[], # 图片链接，支持路径和网络链接
+                # conversation=conversation # 如果指定了对话，将会记录对话
+            )
+            city = city.completion_text
+
+            cron_expression = await self.context.get_using_provider().text_chat(
+                prompt=description,
+                system_prompt="请分析提取出cron表达式，只需要输出cron表达式如 0 9 * * *",
+                image_urls=[], # 图片链接，支持路径和网络链接
+                # conversation=conversation # 如果指定了对话，将会记录对话
+            )
+            cron_expression = cron_expression.completion_text
+
+            human_readable_cron = await self.context.get_using_provider().text_chat(
+                prompt=city + " " + cron_expression,
+                system_prompt="将输入的地点和时间转换为人类可读的格式，方便人理解，字数限制在20个字以内",
+                image_urls=[], # 图片链接，支持路径和网络链接
+                # conversation=conversation # 如果指定了对话，将会记录对话
+            )
+            human_readable_cron = human_readable_cron.completion_text
+
+
+        logger.info(f"city={city}, cron_expression={cron_expression}, human_readable_cron={human_readable_cron}")
+
+
+        d = {
+            "text": "天气预报",
+            "cron": cron_expression,
+            "cron_h": human_readable_cron,
+            "id": str(uuid.uuid4()),
+            "city": city,
+        }
+        if event.unified_msg_origin not in self.subscribe_data:
+            self.subscribe_data[event.unified_msg_origin] = []
+        self.subscribe_data[event.unified_msg_origin].append(d)
+        self.scheduler.add_job(
+            self._subscribe_callback,
+            "cron",
+            id=d["id"],
+            misfire_grace_time=60,
+            **self._parse_cron_expr(cron_expression),
+            args=[event.unified_msg_origin, d],
+        )
+        await self._save_data()
+        yield event.plain_result(f"{human_readable_cron} 订阅成功")
+    
+    def _parse_cron_expr(self, cron_expr: str):
+        logger.info(f"cron_expr={cron_expr}")
+        fields = cron_expr.split(" ")
+        return {
+            "minute": fields[0],
+            "hour": fields[1],
+            "day": fields[2],
+            "month": fields[3],
+            "day_of_week": fields[4],
+        }
+
+    async def _subscribe_callback(self, unified_msg_origin: str, d: dict):
+        """The callback function of the subscribe."""
+        import datetime
+        
+        logger.info("🔔 订阅回调函数被触发！")
+
+        try:
+            city = d.get("city", "苏州")
+            data = await self.get_future_weather_by_city(city)
+            
+            if data is None:
+                logger.error(f"查询 [{city}] 的当前天气失败")
+                return
+            
+            # 根据配置决定发送模式
+            if self.send_mode == "image": # TODO
+                result_img_url = await self.render_current_weather(data)
+                # 发送图片消息
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageEventResult().image(result_img_url)
+                )
+            else:
+                text = format_weather_info(city, data[0])
+                logger.info(f"original weather text={text}")
+                # 使用 LLM 润色结果
+                enhanced_text = await self.use_LLM(text, self.config)
+                logger.info(f"LLM enhanced weather text={enhanced_text}")
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageEventResult().message(enhanced_text)
+                )
+                
+            logger.info(f"天气订阅推送成功: {city}")
+            
+        except Exception as e:
+            logger.error(f"订阅回调执行失败: {e}", exc_info=True)
+    
+    @weather_subscribe_group.command("ls", alia={"展示"})
+    async def subscribe_list(self, event: AstrMessageEvent, city: Optional[str] = ""):
+        """List upcoming subscribe."""
+        subscribe = await self.get_upcoming_subscribe(event.unified_msg_origin)
+        if not subscribe:
+            yield event.plain_result("没有正在进行的订阅事项。")
+        else:
+            subscribe_str = "正在进行的订阅事项：\n"
+            for i, subscribe in enumerate(subscribe):
+                time_ = subscribe.get("datetime", "")
+                if not time_:
+                    cron_expr = subscribe.get("cron", "")
+                    time_ = subscribe.get("cron_h", "") + f"(Cron: {cron_expr})"
+                subscribe_str += f"{i + 1}. {subscribe['text']} - {time_}\n"
+            subscribe_str += "\n使用 /weather_subscribe rm <id> 删除订阅事项。\n"
+            yield event.plain_result(subscribe_str)
+
+    @weather_subscribe_group.command("rm", alias={"删除"})
+    async def subscribe_rm(self, event: AstrMessageEvent, index: int):
+        """Remove a subscribe by index."""
+        subscribe = await self.get_upcoming_subscribe(event.unified_msg_origin)
+
+        if not subscribe:
+            yield event.plain_result("没有待办事项。")
+        elif index < 1 or index > len(subscribe):
+            yield event.plain_result("索引越界。")
+        else:
+            subscribe = subscribe.pop(index - 1)
+            job_id = subscribe.get("id")
+
+            users_subscribe = self.subscribe_data.get(event.unified_msg_origin, [])
+            for i, s in enumerate(users_subscribe):
+                if s.get("id") == job_id:
+                    users_subscribe.pop(i)
+
+            try:
+                self.scheduler.remove_job(job_id)
+            except Exception as e:
+                logger.error(f"Remove job error: {e}")
+                yield event.plain_result(
+                    f"成功移除对应的待办事项。删除定时任务失败: {str(e)} 可能需要重启 AstrBot 以取消该提醒任务。"
+                )
+            await self._save_data()
+            yield event.plain_result("成功删除待办事项：\n" + subscribe["text"])
+
+    async def get_upcoming_subscribe(self, unified_msg_origin: str):
+        """Get upcoming subscribe."""
+        subscribe = self.subscribe_data.get(unified_msg_origin, [])
+        if not subscribe:
+            return []
+        now = datetime.datetime.now(self.timezone)
+        upcoming_subscribe = [
+            subscribe
+            for subscribe in subscribe
+            if "datetime" not in subscribe
+            or datetime.datetime.strptime(
+                subscribe["datetime"], "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=self.timezone)
+            >= now
+        ]
+        return upcoming_subscribe
+
     async def _save_data(self):
         """Save the subscribe data."""
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump([self.group_offset, self.score_threshold, self.interval], f, ensure_ascii=False)
+        subscribe_file = os.path.join(get_astrbot_data_path(), "astrbot-subscribe.json")
+        with open(subscribe_file, "w", encoding="utf-8") as f:
+            json.dump(self.subscribe_data, f, ensure_ascii=False)
+    
+    
+    # =============================
+    # 核心逻辑
+    # =============================
+    async def get_future_weather_by_city(self, city: str) -> Optional[list]:
+        """
+        调用高德开放平台API，获取城市未来天气预报信息
+        Args:
+            city: 城市名称
+        Returns:
+            Optional[list]: 天气预报信息列表，如果获取失败则返回None
+        """
+        logger.debug(f"get_current_weather_by_city city={city}")
+        url = "https://restapi.amap.com/v3/weather/weatherInfo"
+        params = {
+            "key": self.api_key,
+            "city": city,
+            "extensions": "all"
+        }
+        logger.debug(f"Requesting: {url}, params={params}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=10) as resp:
+                    logger.debug(f"Response status: {resp.status}")
+                    if resp.status == 200:
+                        data = await resp.json()
+                        weather_list = []
+                        for daily_weather in data['forecasts'][0]['casts']:
+                              weather_list.append(daily_weather)
+
+                        return weather_list
+                    else:
+                        logger.error(f"get_current_weather_by_city status={resp.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"get_current_weather_by_city error: {e}")
+            logger.error(traceback.format_exc())
+            return None
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        self.scheduler.shutdown()
         await self._save_data()
+        logger.info("weather_subscribe plugin terminated.")
