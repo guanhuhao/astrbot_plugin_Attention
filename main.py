@@ -47,6 +47,14 @@ class MyPlugin(Star):
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+
+    def _get_group_id(self, event: AstrMessageEvent):
+        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        if self.group_offset.get(gid) is None:
+            self.group_offset[gid] = 0
+            self.interval[gid] = 10
+            self.score_threshold[gid] = 50
+        return gid
     
     # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
     @command_group("attention",alias={'群注意力'})
@@ -69,7 +77,7 @@ class MyPlugin(Star):
         参数:
             interval: 回复间隔时间(秒)
         """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         self.interval[gid] = interval
         await self._save_data()
         yield event.plain_result(f"设置主动回复间隔为{self.interval[gid]}秒")
@@ -81,7 +89,7 @@ class MyPlugin(Star):
         参数:
             score_threshold: 回复阈值(0-100)，数值越高越容易回复
         """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         self.score_threshold[gid] = score_threshold
         await self._save_data()
         yield event.plain_result(f"设置回复欲望为{self.score_threshold[gid]}，0-100，0为最低，100为最高")
@@ -91,7 +99,7 @@ class MyPlugin(Star):
         """
         开启群聊注意力
         """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         self.group_offset[gid] = 1
         logger.info(f"当前群聊注意力状态: {self.group_offset[gid]}")
         await self._save_data()
@@ -102,7 +110,7 @@ class MyPlugin(Star):
         """
         关闭群聊注意力
         """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         self.group_offset[gid] = 0
         logger.info(f"当前群聊注意力状态: {self.group_offset[gid]}")
         await self._save_data()
@@ -113,7 +121,7 @@ class MyPlugin(Star):
         """
         显示当前群聊注意力状态
         """
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         if self.group_offset.get(gid) is None:
             self.group_offset[gid] = 0
             self.interval[gid] = 10
@@ -131,7 +139,7 @@ class MyPlugin(Star):
             
         @session_waiter(timeout=10, record_history_chains=True) # 注册一个会话控制器，设置超时时间为 10 秒，记录历史消息链 
         async def empty_mention_waiter(controller: SessionController, event: AstrMessageEvent):
-            gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+            gid = self._get_group_id(event)
             
             controller.keep(timeout=self.interval[gid], reset_timeout=True)
             logger.info(f"update MESSAGE_TIME: controller.ts: {controller.ts} MESSAGE_TIME[gid]: {MESSAGE_TIME[gid]}")
@@ -146,7 +154,7 @@ class MyPlugin(Star):
                 HISTORY_LIST[gid] = controller.get_history_chains()
           
         global LAST_MESSAGE, HISTORY_LIST, MESSAGE_TIME
-        gid = event.get_group_id() if event.get_group_id() else event.unified_msg_origin
+        gid = self._get_group_id(event)
         if self.group_offset.get(gid) is None:
             self.group_offset[gid] = 0
             self.interval[gid] = 10
